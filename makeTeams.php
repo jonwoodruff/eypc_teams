@@ -50,7 +50,7 @@ function collectClusterInfo(array $full_file): array {
             $clusters[$cluster] = [
                 'size' => 0,
                 'languages' => [],
-                'translators' => [],
+                'translationlanguages' => [],
                 'possibleleader' => []
             ];
         }
@@ -58,14 +58,22 @@ function collectClusterInfo(array $full_file): array {
         // Increment size
         $clusters[$cluster]['size']++;
 
-        // Collect language
-        if (!empty($full_file['Language'][$i])) {
+        // Collect language only if English is Poor or None
+        $englishLevel = $full_file['English'][$i] ?? '';
+        if (
+            (!empty($full_file['Language'][$i])) &&
+            (strcasecmp($englishLevel, 'Poor') === 0 || strcasecmp($englishLevel, 'None') === 0)
+        ) {
             $clusters[$cluster]['languages'][] = $full_file['Language'][$i];
         }
 
-        // Collect CanTranslate
+        // Collect CanTranslate, splitting multiple languages
         if (!empty($full_file['CanTranslate'][$i])) {
-            $clusters[$cluster]['translators'][] = $full_file['CanTranslate'][$i];
+            // Split on any sequence of non-word characters (e.g. comma, semicolon, space)
+            $langs = preg_split('/\W+/', $full_file['CanTranslate'][$i], -1, PREG_SPLIT_NO_EMPTY);
+            foreach ($langs as $lang) {
+                $clusters[$cluster]['translationlanguages'][] = $lang;
+            }
         }
 
         // Collect possible team possibleleader
@@ -79,10 +87,10 @@ function collectClusterInfo(array $full_file): array {
         }
     }
 
-    // Make languages and translators unique
+    // Make languages and translationlanguages unique
     foreach ($clusters as &$info) {
         $info['languages'] = array_values(array_unique($info['languages']));
-        $info['translators'] = array_values(array_unique($info['translators']));
+        $info['translationlanguages'] = array_values(array_unique($info['translationlanguages']));
         $info['possibleleader'] = array_values(array_unique($info['possibleleader']));
     }
 
@@ -254,6 +262,164 @@ function balanceTeamLeaders(array $teams, array $clusterInfo): array {
     return $teams;
 }
 
+/**
+ * Attempts to redistribute clusters so that every team has translators for all spoken languages.
+ * Ignores English, and treats Ukrainian and Russian as the same.
+ *
+ * @param array $teams Array of teams (each is an array of cluster codes)
+ * @param array $clusterInfo Output of collectClusterInfo (clusterCode => info array)
+ * @return array New teams array with improved language coverage
+ */
+function balanceTeamLanguages(array $teams, array $clusterInfo): array {
+    // Helper to normalize language names
+    $normalize = function($lang) {
+        $lang = strtolower(trim($lang));
+        if ($lang === 'ukrainian' || $lang === 'ukrain') $lang = 'russian';
+        if ($lang === 'english') return null;
+        return $lang;
+    };
+
+    // Build a map of clusterCode => normalized spoken/translation languages
+    $clusterLangs = [];
+    foreach ($clusterInfo as $code => $info) {
+        $spoken = array_filter(array_map($normalize, $info['languages'] ?? []));
+        $canTranslate = array_filter(array_map($normalize, $info['translationlanguages'] ?? []));
+        $clusterLangs[$code] = [
+            'spoken' => $spoken,
+            'canTranslate' => $canTranslate,
+        ];
+    }
+
+    // Try to fix teams with missing translators
+    $maxIterations = 10; // Avoid infinite loops
+    for ($iter = 0; $iter < $maxIterations; $iter++) {
+        $fixed = true;
+        foreach ($teams as $teamIdx => $team) {
+            // Gather all spoken and translation languages in this team
+            $spoken = [];
+            $canTranslate = [];
+            foreach ($team as $clusterCode) {
+                $spoken = array_merge($spoken, $clusterLangs[$clusterCode]['spoken']);
+                $canTranslate = array_merge($canTranslate, $clusterLangs[$clusterCode]['canTranslate']);
+            }
+            $spoken = array_unique($spoken);
+            $canTranslate = array_unique($canTranslate);
+
+            // Find missing translations
+            $missing = array_diff($spoken, $canTranslate);
+            if (empty($missing)) continue;
+
+            // Try to swap a cluster with a missing language with a cluster from another team that brings a translator
+            foreach ($missing as $lang) {
+                // Find a cluster in this team that speaks $lang but does not translate it
+                foreach ($team as $i => $clusterCode) {
+                    if (in_array($lang, $clusterLangs[$clusterCode]['spoken']) &&
+                        !in_array($lang, $clusterLangs[$clusterCode]['canTranslate'])) {
+                        // Look for a cluster in another team that can translate $lang and does not introduce new missing languages
+                        foreach ($teams as $otherIdx => $otherTeam) {
+                            if ($otherIdx == $teamIdx) continue;
+                            foreach ($otherTeam as $j => $otherCluster) {
+                                if (in_array($lang, $clusterLangs[$otherCluster]['canTranslate'])) {
+                                    // Simulate swap
+                                    $newTeam = $team;
+                                    $newOtherTeam = $otherTeam;
+                                    $newTeam[$i] = $otherCluster;
+                                    $newOtherTeam[$j] = $clusterCode;
+
+                                    // Recalculate spoken/translated for both teams
+                                    $newSpoken = [];
+                                    $newCanTranslate = [];
+                                    foreach ($newTeam as $cc) {
+                                        $newSpoken = array_merge($newSpoken, $clusterLangs[$cc]['spoken']);
+                                        $newCanTranslate = array_merge($newCanTranslate, $clusterLangs[$cc]['canTranslate']);
+                                    }
+                                    $newSpoken = array_unique($newSpoken);
+                                    $newCanTranslate = array_unique($newCanTranslate);
+                                    $newMissing = array_diff($newSpoken, $newCanTranslate);
+
+                                    $otherSpoken = [];
+                                    $otherCanTranslate = [];
+                                    foreach ($newOtherTeam as $cc) {
+                                        $otherSpoken = array_merge($otherSpoken, $clusterLangs[$cc]['spoken']);
+                                        $otherCanTranslate = array_merge($otherCanTranslate, $clusterLangs[$cc]['canTranslate']);
+                                    }
+                                    $otherSpoken = array_unique($otherSpoken);
+                                    $otherCanTranslate = array_unique($otherCanTranslate);
+                                    $otherMissing = array_diff($otherSpoken, $otherCanTranslate);
+
+                                    // Only swap if it doesn't make things worse for either team
+                                    if (count($newMissing) <= count($missing) && count($otherMissing) == 0) {
+                                        // Perform swap
+                                        $teams[$teamIdx][$i] = $otherCluster;
+                                        $teams[$otherIdx][$j] = $clusterCode;
+                                        $fixed = false;
+                                        break 4;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if ($fixed) break;
+    }
+    return $teams;
+}
+
+/**
+ * Redistributes clusters so that no team contains two clusters of the same boy/girl, younger/older category.
+ * If a conflict is found, attempts to swap with another team to resolve it.
+ *
+ * @param array $teams Array of teams (each is an array of cluster codes)
+ * @param array $clusterInfo Output of collectClusterInfo (clusterCode => info array)
+ * @return array New teams array with category conflicts resolved
+ */
+function enforceCategoryUniqueness(array $teams, array $clusterInfo): array {
+    // Helper to extract category from cluster code
+    $getCategory = function($clusterCode) {
+        if (preg_match('/^([bs])([yo])/', $clusterCode, $m)) {
+            return $m[1] . $m[2]; // e.g. by, sy, bo, so
+        }
+        return null;
+    };
+
+    $maxIterations = 10;
+    for ($iter = 0; $iter < $maxIterations; $iter++) {
+        $fixed = true;
+        foreach ($teams as $teamIdx => $team) {
+            $categories = [];
+            foreach ($team as $i => $clusterCode) {
+                $cat = $getCategory($clusterCode);
+                if ($cat === null) continue;
+                if (isset($categories[$cat])) {
+                    // Conflict: two clusters of same category in this team
+                    // Try to swap with another team to resolve
+                    foreach ($teams as $otherIdx => $otherTeam) {
+                        if ($otherIdx == $teamIdx) continue;
+                        foreach ($otherTeam as $j => $otherCluster) {
+                            $otherCat = $getCategory($otherCluster);
+                            // Only swap if it doesn't introduce a new conflict in the other team
+                            $otherTeamCats = array_map($getCategory, $otherTeam);
+                            if (!in_array($cat, $otherTeamCats)) {
+                                // Swap clusters
+                                $teams[$teamIdx][$i] = $otherCluster;
+                                $teams[$otherIdx][$j] = $clusterCode;
+                                $fixed = false;
+                                break 3;
+                            }
+                        }
+                    }
+                } else {
+                    $categories[$cat] = true;
+                }
+            }
+        }
+        if ($fixed) break;
+    }
+    return $teams;
+}
+
 // These are reporting functions to calculate team sizes and print possible leaders
 function calculateTeamSizes(array $teams, array $clusters): array {
     $teamSizes = [];
@@ -288,14 +454,56 @@ function printTeamPossibleLeaders(array $teams, array $clusterInfo): void {
     }
 }
 
+function reportTeamLanguagesAndTranslations(array $teams, array $clusterInfo): void {
+    foreach ($teams as $teamIndex => $team) {
+        $spoken = [];
+        $canTranslate = [];
+        foreach ($team as $clusterCode) {
+            if (!empty($clusterInfo[$clusterCode]['languages'])) {
+                $spoken = array_merge($spoken, $clusterInfo[$clusterCode]['languages']);
+            }
+            if (!empty($clusterInfo[$clusterCode]['translationlanguages'])) {
+                $canTranslate = array_merge($canTranslate, $clusterInfo[$clusterCode]['translationlanguages']);
+            }
+        }
+        $spoken = array_unique($spoken);
+        $canTranslate = array_unique($canTranslate);
+
+        // Normalize: ignore English for translation, treat Ukrainian and Russian as equal
+        $normalize = function($lang) {
+            $lang = strtolower(trim($lang));
+            if ($lang === 'ukrainian' || $lang === 'ukrain') $lang = 'russian';
+            if ($lang === 'english') return null;
+            return $lang;
+        };
+
+        $spokenNorm = array_filter(array_map($normalize, $spoken));
+        $canTranslateNorm = array_filter(array_map($normalize, $canTranslate));
+
+        echo "Team " . ($teamIndex + 1) . ":\n";
+        echo "  Languages spoken: " . (empty($spokenNorm) ? "(none)" : implode(", ", $spokenNorm)) . "\n";
+        echo "  Can translate: " . (empty($canTranslateNorm) ? "(none)" : implode(", ", $canTranslateNorm)) . "\n";
+
+        // Check for spoken languages not covered by translation
+        $missing = array_diff($spokenNorm, $canTranslateNorm);
+        if (!empty($missing)) {
+            echo "  WARNING: No translator for: " . implode(", ", $missing) . "\n";
+        }
+    }
+}
+
 // Print the associative array
 //$clusterCodes = filterAndExtractClusterCodes($full_file["Cluster"]);
 $clusterInfo = collectClusterInfo($full_file);
 print_r($clusterInfo);
 $teams = distributeClustersToTeams($clusterInfo);
+balanceTeamLanguages($teams, $clusterInfo);
+print_r($teams);
 $teams = balanceTeamLeaders($teams, $clusterInfo);
 $teams = balanceTeamLeaders(array_reverse($teams), $clusterInfo);
-//print_r($teams);
+$teams = enforceCategoryUniqueness($teams, $clusterInfo);
+print_r($teams);
 $teamSizes = calculateTeamSizes($teams, $clusterInfo);
 echo "Team sizes: " . implode(", ", $teamSizes) . "\n";
 printTeamPossibleLeaders($teams, $clusterInfo);
+reportTeamLanguagesAndTranslations($teams, $clusterInfo);
