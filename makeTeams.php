@@ -16,7 +16,7 @@ if ($handle === false) {
     exit(1);
 }
 
-$headers = fgetcsv($handle);
+$headers = fgetcsv($handle, separator: ',', enclosure: '"', escape: "");
 if ($headers === false) {
     echo "CSV file is empty or invalid.\n";
     fclose($handle);
@@ -25,7 +25,7 @@ if ($headers === false) {
 
 $full_file = array_fill_keys($headers, []);
 
-while (($row = fgetcsv($handle)) !== false) {
+while (($row = fgetcsv($handle, separator: ',', enclosure: '"', escape: "")) !== false) {
     foreach ($headers as $i => $header) {
         $full_file[$header][] = $row[$i] ?? null;
     }
@@ -90,11 +90,6 @@ function distributeClustersToTeams(array $clusters): array {
         return isset($profile["$gender$age"]);
     }
 
-    // Helper: count unique countries in a team
-    function countryCount($profile) {
-        return isset($profile['countries']) ? count($profile['countries']) : 0;
-    }
-
     // Distribute clusters
     foreach ($parsed as $cluster) {
         $bestTeam = null;
@@ -110,12 +105,12 @@ function distributeClustersToTeams(array $clusters): array {
             // 2. Prefer teams with fewer clusters (for evenness)
             $sizeScore = -count($teams[$i]);
 
-            // 3. Prefer teams with more country diversity
+            // 3. Prefer teams with more country diversity (lower priority)
             $countries = $teamProfiles[$i]['countries'] ?? [];
             $countryScore = in_array($cluster['country'], $countries) ? 0 : 1;
 
-            // 4. Composite score: prioritize country diversity, then evenness
-            $score = $countryScore * 100 + $sizeScore;
+            // 4. Composite score: prioritize evenness, then country diversity
+            $score = $sizeScore * 100 + $countryScore;
 
             if ($score > $bestScore) {
                 $bestScore = $score;
