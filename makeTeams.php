@@ -602,6 +602,15 @@ function balanceTeamSizes(array $teams, array $clusterInfo, int $maxIterations =
     return $teams;
 }
 
+function printClusterAssignmentsCSV(array $teams): void {
+    foreach ($teams as $teamIndex => $team) {
+        $teamNum = $teamIndex + 1;
+        foreach ($team as $clusterCode) {
+            echo $clusterCode . "," . $teamNum . "\n";
+        }
+    }
+}
+
 // Print the associative array
 //$clusterCodes = filterAndExtractClusterCodes($full_file["Cluster"]);
 $clusterInfo = collectClusterInfo($full_file);
@@ -618,3 +627,4 @@ $teamSizes = calculateTeamSizes($teams, $clusterInfo);
 echo "Team sizes: " . implode(", ", $teamSizes) . "\n";
 printTeamPossibleLeaders($teams, $clusterInfo);
 reportTeamLanguagesAndTranslations($teams, $clusterInfo);
+printClusterAssignmentsCSV($teams);
