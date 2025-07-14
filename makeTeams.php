@@ -59,12 +59,12 @@ function collectClusterInfo(array $full_file): array {
         $clusters[$cluster]['size']++;
 
         // Collect language only if English is Poor or None
-        $englishLevel = $full_file['English'][$i] ?? '';
+        $needtranslation = $full_file['NeedTranslationFromEnglish'][$i] ?? '';
         if (
-            (!empty($full_file['Language'][$i])) &&
-            (strcasecmp($englishLevel, 'Poor') === 0 || strcasecmp($englishLevel, 'None') === 0)
+            (!empty($full_file['SpokenLanguage'][$i])) &&
+            (strcasecmp($needtranslation, 'Yes') === 0)
         ) {
-            $clusters[$cluster]['languages'][] = $full_file['Language'][$i];
+            $clusters[$cluster]['languages'][] = $full_file['SpokenLanguage'][$i];
         }
 
         // Collect CanTranslate, splitting multiple languages
@@ -77,7 +77,7 @@ function collectClusterInfo(array $full_file): array {
         }
 
         // Collect possible team possibleleader
-        if (!empty($full_file['TeamLeader'][$i]) && stripos($full_file['TeamLeader'][$i], 'yes') !== false) {
+        if (!empty($full_file['PotentialTL_Shortlist'][$i]) && stripos($full_file['PotentialTL_Shortlist'][$i], 'yes') !== false) {
             $first = $full_file['FirstName'][$i] ?? '';
             $last = $full_file['LastName'][$i] ?? '';
             $name = trim($first . ' ' . $last);
@@ -214,6 +214,14 @@ function distributeClustersToTeams(array $clusters): array {
  * @return array New teams array with improved leader distribution
  */
 function balanceTeamLeaders(array $teams, array $clusterInfo): array {
+    // Helper to extract category from cluster code
+    $getCategory = function($clusterCode) {
+        if (preg_match('/^([bs])([yo])/', $clusterCode, $m)) {
+            return $m[1] . $m[2]; // e.g. by, sy, bo, so
+        }
+        return null;
+    };
+
     // Find which clusters have leaders
     $hasLeader = [];
     foreach ($clusterInfo as $code => $info) {
@@ -237,15 +245,17 @@ function balanceTeamLeaders(array $teams, array $clusterInfo): array {
         }
     }
 
-    // Try to swap clusters: give a leader cluster from a team with >1 to a team with 0
+    // Try to swap clusters: give a leader cluster from a team with >1 to a team with 0, only if same category
     foreach ($teamsWithoutLeaders as $noLeaderIdx) {
         foreach ($teamsWithLeaders as $withLeaderIdx) {
             // Find a cluster with a leader in the donor team
             foreach ($teams[$withLeaderIdx] as $donorKey => $donorCluster) {
                 if ($hasLeader[$donorCluster]) {
-                    // Find a cluster without a leader in the recipient team
+                    $catDonor = $getCategory($donorCluster);
+                    // Find a cluster without a leader in the recipient team, same category
                     foreach ($teams[$noLeaderIdx] as $recipientKey => $recipientCluster) {
-                        if (!$hasLeader[$recipientCluster]) {
+                        $catRecipient = $getCategory($recipientCluster);
+                        if (!$hasLeader[$recipientCluster] && $catDonor === $catRecipient) {
                             // Swap clusters
                             $tmp = $teams[$noLeaderIdx][$recipientKey];
                             $teams[$noLeaderIdx][$recipientKey] = $teams[$withLeaderIdx][$donorKey];
@@ -255,6 +265,19 @@ function balanceTeamLeaders(array $teams, array $clusterInfo): array {
                         }
                     }
                 }
+            }
+        }
+        // Map teams to clusters with/without leaders
+        $teamsWithLeaders = [];
+        foreach ($teams as $i => $team) {
+            $leaderCount = 0;
+            foreach ($team as $clusterCode) {
+                if (!empty($hasLeader[$clusterCode])) {
+                    $leaderCount++;
+                }
+            }
+            if ($leaderCount > 1) {
+                $teamsWithLeaders[] = $i;
             }
         }
     }
@@ -277,6 +300,14 @@ function balanceTeamLanguages(array $teams, array $clusterInfo): array {
         if ($lang === 'ukrainian' || $lang === 'ukrain') $lang = 'russian';
         if ($lang === 'english') return null;
         return $lang;
+    };
+
+    // Helper to extract category from cluster code
+    $getCategory = function($clusterCode) {
+        if (preg_match('/^([bs])([yo])/', $clusterCode, $m)) {
+            return $m[1] . $m[2]; // e.g. by, sy, bo, so
+        }
+        return null;
     };
 
     // Build a map of clusterCode => normalized spoken/translation languages
@@ -315,10 +346,13 @@ function balanceTeamLanguages(array $teams, array $clusterInfo): array {
                 foreach ($team as $i => $clusterCode) {
                     if (in_array($lang, $clusterLangs[$clusterCode]['spoken']) &&
                         !in_array($lang, $clusterLangs[$clusterCode]['canTranslate'])) {
-                        // Look for a cluster in another team that can translate $lang and does not introduce new missing languages
+                        $catA = $getCategory($clusterCode);
+                        // Look for a cluster in another team that can translate $lang and is the same category
                         foreach ($teams as $otherIdx => $otherTeam) {
                             if ($otherIdx == $teamIdx) continue;
                             foreach ($otherTeam as $j => $otherCluster) {
+                                $catB = $getCategory($otherCluster);
+                                if ($catA !== $catB) continue; // Only swap same category
                                 if (in_array($lang, $clusterLangs[$otherCluster]['canTranslate'])) {
                                     // Simulate swap
                                     $newTeam = $team;
@@ -492,16 +526,93 @@ function reportTeamLanguagesAndTranslations(array $teams, array $clusterInfo): v
     }
 }
 
+/**
+ * Attempts to balance the number of people in each team as evenly as possible by swapping clusters.
+ *
+ * @param array $teams Array of teams (each is an array of cluster codes)
+ * @param array $clusterInfo Output of collectClusterInfo (clusterCode => info array)
+ * @param int $maxIterations Maximum number of balancing passes
+ * @return array New teams array with more balanced team sizes
+ */
+function balanceTeamSizes(array $teams, array $clusterInfo, int $maxIterations = 20): array {
+    // Helper to extract category from cluster code
+    $getCategory = function($clusterCode) {
+        if (preg_match('/^([bs])([yo])/', $clusterCode, $m)) {
+            return $m[1] . $m[2]; // e.g. by, sy, bo, so
+        }
+        return null;
+    };
+
+    for ($iter = 0; $iter < $maxIterations; $iter++) {
+        // Calculate team sizes
+        $teamSizes = [];
+        foreach ($teams as $idx => $team) {
+            $size = 0;
+            foreach ($team as $clusterCode) {
+                $size += $clusterInfo[$clusterCode]['size'] ?? 0;
+            }
+            $teamSizes[$idx] = $size;
+        }
+
+        $maxIdx = array_keys($teamSizes, max($teamSizes))[0];
+        $minIdx = array_keys($teamSizes, min($teamSizes))[0];
+
+        // If already balanced (difference <= 1), stop
+        if ($teamSizes[$maxIdx] - $teamSizes[$minIdx] <= 1) {
+            break;
+        }
+
+        $bestSwap = null;
+        $bestDiff = $teamSizes[$maxIdx] - $teamSizes[$minIdx];
+
+        // Try all swaps between max and min teams, but only for clusters of the same category
+        foreach ($teams[$maxIdx] as $i => $clusterA) {
+            $catA = $getCategory($clusterA);
+            if ($catA === null) continue;
+            foreach ($teams[$minIdx] as $j => $clusterB) {
+                $catB = $getCategory($clusterB);
+                if ($catA !== $catB) continue; // Only swap same category
+
+                $sizeA = $clusterInfo[$clusterA]['size'] ?? 0;
+                $sizeB = $clusterInfo[$clusterB]['size'] ?? 0;
+
+                // Simulate swap
+                $newMax = $teamSizes[$maxIdx] - $sizeA + $sizeB;
+                $newMin = $teamSizes[$minIdx] - $sizeB + $sizeA;
+                $diff = abs($newMax - $newMin);
+
+                if ($diff < $bestDiff) {
+                    $bestDiff = $diff;
+                    $bestSwap = [$i, $j];
+                }
+            }
+        }
+
+        // If a swap improves balance, do it
+        if ($bestSwap) {
+            [$i, $j] = $bestSwap;
+            $tmp = $teams[$maxIdx][$i];
+            $teams[$maxIdx][$i] = $teams[$minIdx][$j];
+            $teams[$minIdx][$j] = $tmp;
+        } else {
+            // No improving swap found, stop
+            break;
+        }
+    }
+    return $teams;
+}
+
 // Print the associative array
 //$clusterCodes = filterAndExtractClusterCodes($full_file["Cluster"]);
 $clusterInfo = collectClusterInfo($full_file);
 print_r($clusterInfo);
 $teams = distributeClustersToTeams($clusterInfo);
-balanceTeamLanguages($teams, $clusterInfo);
-print_r($teams);
-$teams = balanceTeamLeaders($teams, $clusterInfo);
-$teams = balanceTeamLeaders(array_reverse($teams), $clusterInfo);
 $teams = enforceCategoryUniqueness($teams, $clusterInfo);
+$teams = balanceTeamSizes($teams, $clusterInfo);
+//$teams = balanceTeamLeaders(array_reverse($teams), $clusterInfo);
+$teams = balanceTeamLanguages($teams, $clusterInfo);
+$teams = balanceTeamLeaders($teams, $clusterInfo);
+
 print_r($teams);
 $teamSizes = calculateTeamSizes($teams, $clusterInfo);
 echo "Team sizes: " . implode(", ", $teamSizes) . "\n";
