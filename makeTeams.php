@@ -51,12 +51,23 @@ function collectClusterInfo(array $full_file): array {
                 'size' => 0,
                 'languages' => [],
                 'translationlanguages' => [],
-                'possibleleader' => []
+                'possibleleader' => [],
+                'yp_count' => 0,
+                'serving_count' => 0
             ];
         }
 
         // Increment size
         $clusters[$cluster]['size']++;
+
+        // Count YP and Serving
+        $status = $full_file['StatusEYPC'][$i] ?? '';
+        if (strcasecmp($status, 'YP') === 0) {
+            $clusters[$cluster]['yp_count']++;
+        }
+        if (stripos($status, 'Serving') !== false) {
+            $clusters[$cluster]['serving_count']++;
+        }
 
         // Collect language only if English is Poor or None
         $needtranslation = $full_file['NeedTranslationFromEnglish'][$i] ?? '';
@@ -69,10 +80,25 @@ function collectClusterInfo(array $full_file): array {
 
         // Collect CanTranslate, splitting multiple languages
         if (!empty($full_file['CanTranslate'][$i])) {
-            // Split on any sequence of non-word characters (e.g. comma, semicolon, space)
             $langs = preg_split('/\W+/', $full_file['CanTranslate'][$i], -1, PREG_SPLIT_NO_EMPTY);
             foreach ($langs as $lang) {
                 $clusters[$cluster]['translationlanguages'][] = $lang;
+            }
+        }
+
+        // Add SpokenLanguage and AlsoFluentIn as translation languages if SpokenEnglish is Fluent or Fair
+        $spokenEnglish = $full_file['SpokenEnglish'][$i] ?? '';
+        if (strcasecmp($spokenEnglish, 'Fluent') === 0 || strcasecmp($spokenEnglish, 'Fair') === 0) {
+            // SpokenLanguage
+            if (!empty($full_file['SpokenLanguage'][$i])) {
+                $clusters[$cluster]['translationlanguages'][] = $full_file['SpokenLanguage'][$i];
+            }
+            // AlsoFluentIn (may be multiple, split)
+            if (!empty($full_file['AlsoFluentIn'][$i])) {
+                $fluentLangs = preg_split('/\W+/', $full_file['AlsoFluentIn'][$i], -1, PREG_SPLIT_NO_EMPTY);
+                foreach ($fluentLangs as $lang) {
+                    $clusters[$cluster]['translationlanguages'][] = $lang;
+                }
             }
         }
 
@@ -298,6 +324,7 @@ function balanceTeamLanguages(array $teams, array $clusterInfo): array {
     $normalize = function($lang) {
         $lang = strtolower(trim($lang));
         if ($lang === 'ukrainian' || $lang === 'ukrain') $lang = 'russian';
+        if (strpos($lang, 'hinese') !== false) $lang = 'chinese';
         if ($lang === 'english') return null;
         return $lang;
     };
@@ -401,6 +428,85 @@ function balanceTeamLanguages(array $teams, array $clusterInfo): array {
     return $teams;
 }
 
+function moveClusterToRandomTeam(array &$teams, string $clusterName): void {
+    $currentTeamIdx = null;
+    $clusterIdx = null;
+
+    // Find the current team and index of the cluster
+    foreach ($teams as $teamIdx => $team) {
+        foreach ($team as $i => $code) {
+            if ($code === $clusterName) {
+                $currentTeamIdx = $teamIdx;
+                $clusterIdx = $i;
+                break 2;
+            }
+        }
+    }
+
+    // If not found, do nothing
+    if ($currentTeamIdx === null || $clusterIdx === null) {
+        echo "Cluster $clusterName not found in any team.\n";
+        return;
+    }
+
+    // Remove from current team
+    array_splice($teams[$currentTeamIdx], $clusterIdx, 1);
+
+    // Pick a random other team
+    $teamCount = count($teams);
+    $otherTeams = array_diff(range(0, $teamCount - 1), [$currentTeamIdx]);
+    $randomTeamIdx = $otherTeams[array_rand($otherTeams)];
+
+    // Add to random team
+    $teams[$randomTeamIdx][] = $clusterName;
+
+    echo "Moved cluster $clusterName from Team " . ($currentTeamIdx + 1) . " to Team " . ($randomTeamIdx + 1) . "\n";
+}
+
+function fixMultipleDuplicateCategories(array $teams): array {
+    // Helper to extract category from cluster code
+    $getCategory = function($clusterCode) {
+        if (preg_match('/^([bs])([yo])/', $clusterCode, $m)) {
+            return $m[1] . $m[2]; // e.g. by, sy, bo, so
+        }
+        return null;
+    };
+
+    $categories = ['by', 'sy', 'bo', 'so'];
+    $maxIterations = 20;
+    $changed = true;
+    for ($iter = 0; $iter < $maxIterations && $changed; $iter++) {
+        $changed = false;
+        foreach ($teams as $teamIdx => $team) {
+            // Count categories in this team
+            $catCounts = [];
+            $catPositions = [];
+            foreach ($team as $i => $clusterCode) {
+                $cat = $getCategory($clusterCode);
+                if ($cat) {
+                    $catCounts[$cat] = ($catCounts[$cat] ?? 0) + 1;
+                    $catPositions[$cat][] = $i;
+                }
+            }
+            // Find all categories with duplicates in this team
+            $dupeCats = [];
+            foreach ($catCounts as $cat => $count) {
+                if ($count > 2) {
+                    moveClusterToRandomTeam($teams, $team[$catPositions[$cat][1]]);
+                    $changed = true;
+                } else if ($count > 1) $dupeCats[] = $cat;
+            }
+            if (count($dupeCats) > 1 && !$changed) {
+                // Move the second occurrence of the first duplicate category
+                moveClusterToRandomTeam($teams, $team[$catPositions[$dupeCats[0]][1]]);
+                $changed = true;
+            }
+            if ($changed) break; // Restart the loop if we made a change
+        }
+    }
+    return $teams;
+}
+
 /**
  * Redistributes clusters so that no team contains two clusters of the same boy/girl, younger/older category.
  * If a conflict is found, attempts to swap with another team to resolve it.
@@ -418,40 +524,62 @@ function enforceCategoryUniqueness(array $teams, array $clusterInfo): array {
         return null;
     };
 
-    $maxIterations = 10;
+    $categories = ['by', 'sy', 'bo', 'so'];
+    $maxIterations = 40;
     for ($iter = 0; $iter < $maxIterations; $iter++) {
-        $fixed = true;
-        foreach ($teams as $teamIdx => $team) {
-            $categories = [];
-            foreach ($team as $i => $clusterCode) {
-                $cat = $getCategory($clusterCode);
-                if ($cat === null) continue;
-                if (isset($categories[$cat])) {
-                    // Conflict: two clusters of same category in this team
-                    // Try to swap with another team to resolve
-                    foreach ($teams as $otherIdx => $otherTeam) {
-                        if ($otherIdx == $teamIdx) continue;
-                        foreach ($otherTeam as $j => $otherCluster) {
-                            $otherCat = $getCategory($otherCluster);
-                            // Only swap if it doesn't introduce a new conflict in the other team
-                            $otherTeamCats = array_map($getCategory, $otherTeam);
-                            if (!in_array($cat, $otherTeamCats)) {
-                                // Swap clusters
-                                $teams[$teamIdx][$i] = $otherCluster;
-                                $teams[$otherIdx][$j] = $clusterCode;
-                                $fixed = false;
-                                break 3;
-                            }
+        $changed = false;
+        foreach ($categories as $cat) {
+            // Build lists of teams by count of this category
+            $catCounts = [];
+            $catPositions = []; // [teamIdx => [clusterIdx, ...]]
+            foreach ($teams as $teamIdx => $team) {
+                $catClusters = [];
+                foreach ($team as $i => $clusterCode) {
+                    if ($getCategory($clusterCode) === $cat) {
+                        $catClusters[] = $i;
+                    }
+                }
+                $catPositions[$teamIdx] = $catClusters;
+                $catCounts[$teamIdx] = count($catClusters);
+            }
+
+            // While any team has more than min+1 of this category, and another team has less
+            while (true) {
+                $maxCount = max($catCounts);
+                $minCount = min($catCounts);
+                // Don't allow a team to have more than min+1 unless all teams have at least min+1
+                if ($maxCount <= $minCount + 1) break;
+
+                // Find a team with maxCount and a team with minCount
+                $fromTeam = array_search($maxCount, $catCounts);
+                $toTeam = array_search($minCount, $catCounts);
+
+                // Move one of the extras (not the first, to keep at least min+1)
+                $moveIdx = $catPositions[$fromTeam][$minCount + 1]; // e.g. 2nd if min=1, 3rd if min=2
+                $clusterToMove = $teams[$fromTeam][$moveIdx];
+                // Remove from fromTeam
+                array_splice($teams[$fromTeam], $moveIdx, 1);
+                // Add to toTeam
+                $teams[$toTeam][] = $clusterToMove;
+                $changed = true;
+
+                // Update counts and positions for next round
+                // Rebuild only for affected teams
+                foreach ([$fromTeam, $toTeam] as $teamIdx) {
+                    $catClusters = [];
+                    foreach ($teams[$teamIdx] as $i => $clusterCode) {
+                        if ($getCategory($clusterCode) === $cat) {
+                            $catClusters[] = $i;
                         }
                     }
-                } else {
-                    $categories[$cat] = true;
+                    $catPositions[$teamIdx] = $catClusters;
+                    $catCounts[$teamIdx] = count($catClusters);
                 }
             }
         }
-        if ($fixed) break;
+        if (!$changed) break;
     }
-    return $teams;
+    return fixMultipleDuplicateCategories($teams);
 }
 
 // These are reporting functions to calculate team sizes and print possible leaders
@@ -507,6 +635,7 @@ function reportTeamLanguagesAndTranslations(array $teams, array $clusterInfo): v
         $normalize = function($lang) {
             $lang = strtolower(trim($lang));
             if ($lang === 'ukrainian' || $lang === 'ukrain') $lang = 'russian';
+            if (strpos($lang, 'hinese') !== false) $lang = 'chinese';
             if ($lang === 'english') return null;
             return $lang;
         };
@@ -611,20 +740,177 @@ function printClusterAssignmentsCSV(array $teams): void {
     }
 }
 
+function assignTeamsToFullFile(array $teams, array $full_file): array {
+    // Build a map from cluster code to team number
+    $clusterToTeam = [];
+    foreach ($teams as $teamIndex => $team) {
+        $teamNum = $teamIndex + 1;
+        foreach ($team as $clusterCode) {
+            $clusterToTeam[$clusterCode] = $teamNum;
+        }
+    }
+
+    // Add a new column "TeamNumber" to $full_file
+    if (!in_array('TeamNumber', $full_file)) {
+        $full_file['TeamNumber'] = [];
+    }
+
+    $numRows = count($full_file['Cluster']);
+    for ($i = 0; $i < $numRows; $i++) {
+        $clusterCode = null;
+        if (preg_match('/\b[bs][yo][A-Z]{2}\d+[ab]?\b/', $full_file['Cluster'][$i], $matches)) {
+            $clusterCode = $matches[0];
+        }
+        $full_file['TeamNumber'][$i] = $clusterCode && isset($clusterToTeam[$clusterCode])
+            ? $clusterToTeam[$clusterCode]
+            : null;
+    }
+
+    return $full_file;
+}
+
+function writeTeamsSummaryCSV(array $teams, array $clusterInfo, string $filename = "teams.csv"): void {
+    // Helper to extract category from cluster code
+    $getCategory = function($clusterCode) {
+        if (preg_match('/^([bs])([yo])/', $clusterCode, $m)) {
+            return $m[1] . $m[2]; // e.g. by, sy, bo, so
+        }
+        return null;
+    };
+
+    // Helper to normalize language names
+    $normalize = function($lang) {
+        $lang = strtolower(trim($lang));
+        if ($lang === 'ukrainian' || $lang === 'ukrain') $lang = 'russian';
+        if (strpos($lang, 'hinese') !== false) $lang = 'chinese';
+        if ($lang === 'english') return null;
+        return $lang;
+    };
+
+    $file = fopen($filename, "w");
+    if ($file === false) {
+        echo "Failed to open $filename for writing.\n";
+        return;
+    }
+
+    // Write header
+    $header = [
+        "TeamNumber",
+        "TeamSize",
+        "YPCount",
+        "ServingCount",
+        "by_clusters",
+        "sy_clusters",
+        "bo_clusters",
+        "so_clusters",
+        "TranslationNeeded",
+        "TranslationAvailable",
+        "TranslationMissing",
+        "PotentialLeaders"
+    ];
+    fputcsv($file, $header, ",", '"', "\\");
+
+    foreach ($teams as $teamIndex => $team) {
+        $teamNum = $teamIndex + 1;
+        $teamSize = 0;
+        $ypCount = 0;
+        $servingCount = 0;
+        $categories = ['by' => [], 'sy' => [], 'bo' => [], 'so' => []];
+        $spoken = [];
+        $canTranslate = [];
+        $leaders = [];
+
+        foreach ($team as $clusterCode) {
+            $cat = $getCategory($clusterCode);
+            if ($cat && isset($categories[$cat])) {
+                $categories[$cat][] = $clusterCode;
+            }
+            $teamSize += $clusterInfo[$clusterCode]['size'] ?? 0;
+            $ypCount += $clusterInfo[$clusterCode]['yp_count'] ?? 0;
+            $servingCount += $clusterInfo[$clusterCode]['serving_count'] ?? 0;
+            if (!empty($clusterInfo[$clusterCode]['languages'])) {
+                $spoken = array_merge($spoken, $clusterInfo[$clusterCode]['languages']);
+            }
+            if (!empty($clusterInfo[$clusterCode]['translationlanguages'])) {
+                $canTranslate = array_merge($canTranslate, $clusterInfo[$clusterCode]['translationlanguages']);
+            }
+            if (!empty($clusterInfo[$clusterCode]['possibleleader'])) {
+                $leaders = array_merge($leaders, $clusterInfo[$clusterCode]['possibleleader']);
+            }
+        }
+
+        // Normalize languages
+        $spokenNorm = array_filter(array_map($normalize, $spoken));
+        $canTranslateNorm = array_filter(array_map($normalize, $canTranslate));
+        $spokenNorm = array_unique($spokenNorm);
+        $canTranslateNorm = array_unique($canTranslateNorm);
+
+        // Languages missing translation
+        $missing = array_diff($spokenNorm, $canTranslateNorm);
+
+        // Prepare row
+        $row = [
+            $teamNum,
+            $teamSize,
+            $ypCount,
+            $servingCount,
+            implode(" ", $categories['by']),
+            implode(" ", $categories['sy']),
+            implode(" ", $categories['bo']),
+            implode(" ", $categories['so']),
+            implode(" ", $spokenNorm),
+            implode(" ", $canTranslateNorm),
+            implode(" ", $missing),
+            implode("; ", array_unique($leaders))
+        ];
+        fputcsv($file, $row, ",", '"', "\\");
+    }
+
+    fclose($file);
+    echo "Team summary written to $filename\n";
+}
+
 // Print the associative array
 //$clusterCodes = filterAndExtractClusterCodes($full_file["Cluster"]);
 $clusterInfo = collectClusterInfo($full_file);
-print_r($clusterInfo);
+//print_r($clusterInfo);
 $teams = distributeClustersToTeams($clusterInfo);
 $teams = enforceCategoryUniqueness($teams, $clusterInfo);
 $teams = balanceTeamSizes($teams, $clusterInfo);
-//$teams = balanceTeamLeaders(array_reverse($teams), $clusterInfo);
 $teams = balanceTeamLanguages($teams, $clusterInfo);
 $teams = balanceTeamLeaders($teams, $clusterInfo);
 
-print_r($teams);
+//print_r($teams);
 $teamSizes = calculateTeamSizes($teams, $clusterInfo);
-echo "Team sizes: " . implode(", ", $teamSizes) . "\n";
-printTeamPossibleLeaders($teams, $clusterInfo);
-reportTeamLanguagesAndTranslations($teams, $clusterInfo);
+//echo "Team sizes: " . implode(", ", $teamSizes) . "\n";
+//printTeamPossibleLeaders($teams, $clusterInfo);
+//reportTeamLanguagesAndTranslations($teams, $clusterInfo);
 printClusterAssignmentsCSV($teams);
+
+$full_file_with_teams = assignTeamsToFullFile($teams, $full_file);
+
+// Write results to output.csv
+$outputFile = fopen("registrants.csv", "w");
+if ($outputFile === false) {
+    echo "Failed to open registrants.csv for writing.\n";
+    exit(1);
+}
+
+// Write header
+$headers = array_keys($full_file_with_teams);
+fputcsv($outputFile, $headers, ",", '"', "\\");
+
+// Write each row
+$numRows = count($full_file_with_teams[$headers[0]]);
+for ($i = 0; $i < $numRows; $i++) {
+    $row = [];
+    foreach ($headers as $header) {
+        $row[] = $full_file_with_teams[$header][$i] ?? '';
+    }
+    fputcsv($outputFile, $row, ",", '"', "\\");
+}
+
+fclose($outputFile);
+echo "Results written to registrants.csv\n";
+
+ writeTeamsSummaryCSV($teams, $clusterInfo);
