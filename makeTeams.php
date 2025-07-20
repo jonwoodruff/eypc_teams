@@ -870,6 +870,75 @@ function writeTeamsSummaryCSV(array $teams, array $clusterInfo, string $filename
     echo "Team summary written to $filename\n";
 }
 
+/**
+ * This function fulfills a special request for 2025 EYPC
+ * Swaps clusters between teams so that both soRO01 and soOT01 end up in the same team.
+ * If already together, does nothing. If not, swaps soOT01 into the team with soRO01.
+ *
+ * @param array $teams Array of teams (each is an array of cluster codes)
+ * @return array Modified teams array
+ */
+function putSoRO01AndSoOT01Together(array $teams): array {
+    $clusterA = 'soRO01';
+    $clusterB = 'soOT01';
+    $teamA = null;
+    $teamB = null;
+    $idxA = null;
+    $idxB = null;
+
+    // Find the teams and positions for both clusters
+    foreach ($teams as $teamIdx => $team) {
+        foreach ($team as $i => $clusterCode) {
+            if ($clusterCode === $clusterA) {
+                $teamA = $teamIdx;
+                $idxA = $i;
+            }
+            if ($clusterCode === $clusterB) {
+                $teamB = $teamIdx;
+                $idxB = $i;
+            }
+        }
+    }
+
+    // If either not found, do nothing
+    if ($teamA === null || $teamB === null) {
+        echo "Could not find both $clusterA and $clusterB in teams.\n";
+        return $teams;
+    }
+
+    // If already together, do nothing
+    if ($teamA === $teamB) {
+        echo "$clusterA and $clusterB are already in the same team.\n";
+        return $teams;
+    }
+
+    // Move soOT01 into the team with soRO01 by swapping with a cluster of the same category (so)
+    $getCategory = function($clusterCode) {
+        if (preg_match('/^([bs])([yo])/', $clusterCode, $m)) {
+            return $m[1] . $m[2];
+        }
+        return null;
+    };
+
+    // Find a cluster in teamA (soRO01's team) with the same category as soOT01 (so)
+    foreach ($teams[$teamA] as $swapIdx => $swapCluster) {
+        if ($swapCluster === $clusterA) continue; // Don't swap soRO01 out
+        if ($getCategory($swapCluster) === 'so') {
+            // Swap soOT01 and this cluster
+            $teams[$teamA][$swapIdx] = $clusterB;
+            $teams[$teamB][$idxB] = $swapCluster;
+            echo "Swapped $clusterB into team with $clusterA.\n";
+            return $teams;
+        }
+    }
+
+    // If no suitable swap found, just move soOT01 into teamA (may increase so count)
+    array_splice($teams[$teamB], $idxB, 1);
+    $teams[$teamA][] = $clusterB;
+    echo "Moved $clusterB into team with $clusterA (no swap).\n";
+    return $teams;
+}
+
 // Print the associative array
 //$clusterCodes = filterAndExtractClusterCodes($full_file["Cluster"]);
 $clusterInfo = collectClusterInfo($full_file);
@@ -879,6 +948,7 @@ $teams = enforceCategoryUniqueness($teams, $clusterInfo);
 $teams = balanceTeamSizes($teams, $clusterInfo);
 $teams = balanceTeamLanguages($teams, $clusterInfo);
 $teams = balanceTeamLeaders($teams, $clusterInfo);
+$teams = putSoRO01AndSoOT01Together($teams);
 
 //print_r($teams);
 $teamSizes = calculateTeamSizes($teams, $clusterInfo);
