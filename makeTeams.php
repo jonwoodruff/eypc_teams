@@ -769,7 +769,7 @@ function assignTeamsToFullFile(array $teams, array $full_file): array {
     return $full_file;
 }
 
-function writeTeamsSummaryCSV(array $teams, array $clusterInfo, string $filename = "teams.csv"): void {
+function writeTeamsSummaryCSV(array $teams, array $clusterInfo, array $teamLeaders, string $filename = "teams.csv"): void {
     // Helper to extract category from cluster code
     $getCategory = function($clusterCode) {
         if (preg_match('/^([bs])([yo])/', $clusterCode, $m)) {
@@ -806,7 +806,8 @@ function writeTeamsSummaryCSV(array $teams, array $clusterInfo, string $filename
         "TranslationNeeded",
         "TranslationAvailable",
         "TranslationMissing",
-        "PotentialLeaders"
+        "PotentialLeaders",
+        "Leader"
     ];
     fputcsv($file, $header, ",", '"', "\\");
 
@@ -848,6 +849,9 @@ function writeTeamsSummaryCSV(array $teams, array $clusterInfo, string $filename
         // Languages missing translation
         $missing = array_diff($spokenNorm, $canTranslateNorm);
 
+        // Get best leader for this team
+        $leader = $teamLeaders[$teamNum] ?? '';
+
         // Prepare row
         $row = [
             $teamNum,
@@ -861,7 +865,8 @@ function writeTeamsSummaryCSV(array $teams, array $clusterInfo, string $filename
             implode(" ", $spokenNorm),
             implode(" ", $canTranslateNorm),
             implode(" ", $missing),
-            implode("; ", array_unique($leaders))
+            implode("; ", array_unique($leaders)),
+            $leader
         ];
         fputcsv($file, $row, ",", '"', "\\");
     }
@@ -871,16 +876,16 @@ function writeTeamsSummaryCSV(array $teams, array $clusterInfo, string $filename
 }
 
 /**
- * This function fulfills a special request for 2025 EYPC
- * Swaps clusters between teams so that both soRO01 and soOT01 end up in the same team.
- * If already together, does nothing. If not, swaps soOT01 into the team with soRO01.
+ * Swaps clusters between teams so that both specified clusters end up in the same team.
+ * If already together, does nothing. If not, swaps the second cluster into the team with the first,
+ * swapping with a cluster of the same category if possible.
  *
  * @param array $teams Array of teams (each is an array of cluster codes)
+ * @param string $clusterA First cluster code
+ * @param string $clusterB Second cluster code
  * @return array Modified teams array
  */
-function putSoRO01AndSoOT01Together(array $teams): array {
-    $clusterA = 'soRO01';
-    $clusterB = 'soOT01';
+function putClustersTogether(array $teams, string $clusterA, string $clusterB): array {
     $teamA = null;
     $teamB = null;
     $idxA = null;
@@ -912,7 +917,7 @@ function putSoRO01AndSoOT01Together(array $teams): array {
         return $teams;
     }
 
-    // Move soOT01 into the team with soRO01 by swapping with a cluster of the same category (so)
+    // Helper to extract category from cluster code
     $getCategory = function($clusterCode) {
         if (preg_match('/^([bs])([yo])/', $clusterCode, $m)) {
             return $m[1] . $m[2];
@@ -920,11 +925,13 @@ function putSoRO01AndSoOT01Together(array $teams): array {
         return null;
     };
 
-    // Find a cluster in teamA (soRO01's team) with the same category as soOT01 (so)
+    $catB = $getCategory($clusterB);
+
+    // Try to swap clusterB into teamA by swapping with a cluster of the same category
     foreach ($teams[$teamA] as $swapIdx => $swapCluster) {
-        if ($swapCluster === $clusterA) continue; // Don't swap soRO01 out
-        if ($getCategory($swapCluster) === 'so') {
-            // Swap soOT01 and this cluster
+        if ($swapCluster === $clusterA) continue; // Don't swap clusterA out
+        if ($getCategory($swapCluster) === $catB) {
+            // Swap clusterB and this cluster
             $teams[$teamA][$swapIdx] = $clusterB;
             $teams[$teamB][$idxB] = $swapCluster;
             echo "Swapped $clusterB into team with $clusterA.\n";
@@ -932,11 +939,113 @@ function putSoRO01AndSoOT01Together(array $teams): array {
         }
     }
 
-    // If no suitable swap found, just move soOT01 into teamA (may increase so count)
+    // If no suitable swap found, just move clusterB into teamA (may increase category count)
     array_splice($teams[$teamB], $idxB, 1);
     $teams[$teamA][] = $clusterB;
     echo "Moved $clusterB into team with $clusterA (no swap).\n";
     return $teams;
+}
+
+/**
+ * For each pair of clusters in a static list, calls putClustersTogether to ensure both clusters are in the same team.
+ *
+ * @param array $teams Array of teams (each is an array of cluster codes)
+ * @return array Modified teams array
+ */
+function putRequestedClusterPairsTogether(array $teams): array {
+    // Example pairs to put together
+    $pairs = [
+        ['soOT01', 'soRO01'],
+        ['sySP01a', 'sySP04a'],
+        ['soUK04a', 'soUK05a'],
+        ['syFR01a', 'syFR02a'],
+        ['sySP01a', 'sySP04a'],
+        ['bySE01', 'byUK09'],
+        ['boNA06', 'syNA01'],
+        ['syUK05', 'sySE01'], // add more pairs as needed
+    ];
+
+    foreach ($pairs as $pair) {
+        if (count($pair) == 2) {
+            $teams = putClustersTogether($teams, $pair[0], $pair[1]);
+        }
+    }
+    return $teams;
+}
+
+/**
+ * Returns the best potential team leader from the clusters in a team, using $full_file for details.
+ * Priority: 1) Over 30 years old (AgeAtConf), 2) Brother (Gender), 3) Otherwise first in list.
+ *
+ * @param array $team Array of cluster codes in the team
+ * @param array $full_file Full registrant data
+ * @return string|null Best leader name or null if none found
+ */
+function getBestTeamLeader(array $team, array $full_file): ?string {
+    $potentialLeaders = [];
+
+    // Build a map from cluster code to indices in $full_file
+    $clusterIndices = [];
+    foreach ($team as $clusterCode) {
+        foreach ($full_file['Cluster'] as $i => $clusterVal) {
+            if (preg_match('/\b[bs][yo][A-Z]{2}\d+[ab]?\b/', $clusterVal, $matches) && $matches[0] === $clusterCode) {
+                $clusterIndices[$clusterCode][] = $i;
+            }
+        }
+    }
+
+    // Gather all potential leaders from these clusters
+    foreach ($clusterIndices as $clusterCode => $indices) {
+        foreach ($indices as $i) {
+            if (!empty($full_file['PotentialTL_Shortlist'][$i]) && stripos($full_file['PotentialTL_Shortlist'][$i], 'yes') !== false) {
+                $name = trim(($full_file['FirstName'][$i] ?? '') . ' ' . ($full_file['LastName'][$i] ?? ''));
+                if ($name !== '') {
+                    $potentialLeaders[] = [
+                        'name' => $name,
+                        'age' => intval($full_file['AgeAtConf'][$i] ?? 0),
+                        'gender' => strtolower($full_file['Gender'][$i] ?? ''),
+                    ];
+                }
+            }
+        }
+    }
+
+    if (empty($potentialLeaders)) return null;
+
+    // 1. Prioritize over 30 years old
+    $over30 = array_filter($potentialLeaders, fn($p) => $p['age'] > 30);
+    if (!empty($over30)) {
+        // 2. Prioritize Brother
+        $brotherOver30 = array_filter($over30, fn($p) => $p['gender'] === 'brother');
+        if (!empty($brotherOver30)) {
+            return $brotherOver30[array_key_first($brotherOver30)]['name'];
+        }
+        return $over30[array_key_first($over30)]['name'];
+    }
+
+    // 2. Prioritize Brother
+    $brother = array_filter($potentialLeaders, fn($p) => $p['gender'] === 'brother');
+    if (!empty($brother)) {
+        return $brother[array_key_first($brother)]['name'];
+    }
+
+    // 3. Otherwise, first in list
+    return $potentialLeaders[0]['name'];
+}
+
+/**
+ * Returns an array of best team leaders for each team.
+ *
+ * @param array $teams Array of teams (each is an array of cluster codes)
+ * @param array $full_file Full registrant data
+ * @return array Array of best leader names (or null) indexed by team number (starting from 1)
+ */
+function getAllBestTeamLeaders(array $teams, array $full_file): array {
+    $leaders = [];
+    foreach ($teams as $teamIndex => $team) {
+        $leaders[$teamIndex + 1] = getBestTeamLeader($team, $full_file);
+    }
+    return $leaders;
 }
 
 // Print the associative array
@@ -947,15 +1056,18 @@ $teams = distributeClustersToTeams($clusterInfo);
 $teams = enforceCategoryUniqueness($teams, $clusterInfo);
 $teams = balanceTeamSizes($teams, $clusterInfo);
 $teams = balanceTeamLanguages($teams, $clusterInfo);
+$teams = putRequestedClusterPairsTogether($teams);
 $teams = balanceTeamLeaders($teams, $clusterInfo);
-$teams = putSoRO01AndSoOT01Together($teams);
+$teams = enforceCategoryUniqueness($teams, $clusterInfo);
+$teams = putRequestedClusterPairsTogether($teams);
 
 //print_r($teams);
 $teamSizes = calculateTeamSizes($teams, $clusterInfo);
+$teamLeaders = getAllBestTeamLeaders($teams, $full_file);
 //echo "Team sizes: " . implode(", ", $teamSizes) . "\n";
 //printTeamPossibleLeaders($teams, $clusterInfo);
 //reportTeamLanguagesAndTranslations($teams, $clusterInfo);
-printClusterAssignmentsCSV($teams);
+//printClusterAssignmentsCSV($teams);
 
 $full_file_with_teams = assignTeamsToFullFile($teams, $full_file);
 
@@ -983,4 +1095,4 @@ for ($i = 0; $i < $numRows; $i++) {
 fclose($outputFile);
 echo "Results written to registrants.csv\n";
 
- writeTeamsSummaryCSV($teams, $clusterInfo);
+ writeTeamsSummaryCSV($teams, $clusterInfo, $teamLeaders, "teams.csv");
