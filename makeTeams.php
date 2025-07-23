@@ -962,6 +962,7 @@ function putRequestedClusterPairsTogether(array $teams): array {
         ['sySP01a', 'sySP04a'],
         ['bySE01', 'byUK09'],
         ['boNA06', 'syNA01'],
+        ['byUK02a', 'byUK10a'],
         ['syUK05', 'sySE01'], // add more pairs as needed
     ];
 
