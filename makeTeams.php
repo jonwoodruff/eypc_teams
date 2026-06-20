@@ -35,7 +35,32 @@ fclose($handle);
 
 function collectClusterInfo(array $full_file): array {
     $clusters = [];
-    $numRows = count($full_file['Cluster']);
+    $numRows = isset($full_file['Cluster']) ? count($full_file['Cluster']) : 0;
+
+    // Normalizer: trims, extracts "other (...)" and maps Cyrillic -> English, lowercases.
+    $normalizeLang = function(string $lang): string {
+        $lang = trim($lang, " \t\n\r\0\x0B;,:.()[]");
+        if ($lang === '') return '';
+        // If form is "other (korean)" or malformed like "other (korean" -> extract "korean"
+        if (preg_match('/^\s*other\s*\(\s*([^)]+)\s*\)?\s*$/i', $lang, $m)) {
+            $lang = trim($m[1]);
+        } elseif (preg_match('/^\s*other\s*[:\-]\s*(.+)$/i', $lang, $m)) {
+            // handle "other: korean" or "other - korean"
+            $lang = trim($m[1]);
+        }
+        $langLower = mb_strtolower($lang, 'UTF-8');
+
+        // Cyrillic -> latin mappings
+        if (preg_match('/русск/ui', $langLower)) return 'russian';
+        if (preg_match('/украин/ui', $langLower)) return 'ukrainian';
+
+        // Common fixes
+        if (strpos($langLower, 'hinese') !== false) return 'chinese';
+
+        // return normalized lower-case token
+        return $langLower;
+    };
+
     for ($i = 0; $i < $numRows; $i++) {
         // Extract cluster code
         if (!isset($full_file['Cluster'][$i])) continue;
@@ -70,34 +95,52 @@ function collectClusterInfo(array $full_file): array {
         }
 
         // Collect language only if English is Poor or None
-        $needtranslation = $full_file['NeedTranslationFromEnglish'][$i] ?? '';
-        if (
-            (!empty($full_file['SpokenLanguage'][$i])) &&
-            (strcasecmp($needtranslation, 'Yes') === 0)
-        ) {
-            $clusters[$cluster]['languages'][] = $full_file['SpokenLanguage'][$i];
+        $needtranslation = $full_file['NeedTranslationFromEnglishForMessages'][$i] ?? '';
+        $spokenRaw = (string) ($full_file['SpokenLanguage'][$i] ?? '');
+        if ($spokenRaw !== '' && strcasecmp($needtranslation, 'Yes') === 0) {
+            // Split SpokenLanguage into multiple entries (handles "Polish;, Russian;, Ukrainian" etc.)
+            $langs = preg_split('/[;,\/]+|\band\b/i', $spokenRaw);
+            foreach ($langs as $lang) {
+                $norm = $normalizeLang((string)$lang);
+                if ($norm === '') continue;
+                $clusters[$cluster]['languages'][] = $norm;
+            }
         }
 
-        // Collect CanTranslate, splitting multiple languages
-        if (!empty($full_file['CanTranslate'][$i])) {
-            $langs = preg_split('/\W+/', $full_file['CanTranslate'][$i], -1, PREG_SPLIT_NO_EMPTY);
+        // Collect CanTranslate / CanHelpTranslate, splitting multiple languages
+        $canHelpRaw = (string) (
+            $full_file['CanHelpTranslate'][$i]
+            ?? $full_file['CanTranslate'][$i]
+            ?? ''
+        );
+        if ($canHelpRaw !== '') {
+            $langs = preg_split('/[;,\/]+|\band\b/i', $canHelpRaw);
             foreach ($langs as $lang) {
-                $clusters[$cluster]['translationlanguages'][] = $lang;
+                $norm = $normalizeLang((string)$lang);
+                if ($norm === '') continue;
+                $clusters[$cluster]['translationlanguages'][] = $norm;
             }
         }
 
         // Add SpokenLanguage and AlsoFluentIn as translation languages if SpokenEnglish is Fluent or Fair
         $spokenEnglish = $full_file['SpokenEnglish'][$i] ?? '';
         if (strcasecmp($spokenEnglish, 'Fluent') === 0 || strcasecmp($spokenEnglish, 'Fair') === 0) {
-            // SpokenLanguage
-            if (!empty($full_file['SpokenLanguage'][$i])) {
-                $clusters[$cluster]['translationlanguages'][] = $full_file['SpokenLanguage'][$i];
+            if ($spokenRaw !== '') {
+                $langs = preg_split('/[;,\/]+|\band\b/i', $spokenRaw);
+                foreach ($langs as $lang) {
+                    $norm = $normalizeLang((string)$lang);
+                    if ($norm === '') continue;
+                    $clusters[$cluster]['translationlanguages'][] = $norm;
+                }
             }
             // AlsoFluentIn (may be multiple, split)
-            if (!empty($full_file['AlsoFluentIn'][$i])) {
-                $fluentLangs = preg_split('/\W+/', $full_file['AlsoFluentIn'][$i], -1, PREG_SPLIT_NO_EMPTY);
+            $fluentRaw = (string) ($full_file['AlsoFluentIn'][$i] ?? '');
+            if ($fluentRaw !== '') {
+                $fluentLangs = preg_split('/[;,\/]+|\band\b/i', $fluentRaw);
                 foreach ($fluentLangs as $lang) {
-                    $clusters[$cluster]['translationlanguages'][] = $lang;
+                    $norm = $normalizeLang((string)$lang);
+                    if ($norm === '') continue;
+                    $clusters[$cluster]['translationlanguages'][] = $norm;
                 }
             }
         }
@@ -148,14 +191,14 @@ function countOccurrences(array $input): array {
 }
 */
 /**
- * Distributes clusters into 42 teams, prioritizing even team sizes over country mixing.
+ * Distributes clusters into 48 teams, prioritizing even team sizes over country mixing.
  *
  * @param array $clusters Associative array: key = cluster code, value = array with 'size', 'languages', etc.
- * @return array Array of 42 teams, each a list of cluster codes
+ * @return array Array of 48 teams, each a list of cluster codes
  */
 function distributeClustersToTeams(array $clusters): array {
-    $teams = array_fill(0, 42, []);
-    $teamProfiles = array_fill(0, 42, []); // Track gender/age/country per team
+    $teams = array_fill(0, 48, []);
+    $teamProfiles = array_fill(0, 48, []); // Track gender/age/country per team
 
     // Parse cluster info
     $parsed = [];
@@ -187,7 +230,7 @@ function distributeClustersToTeams(array $clusters): array {
         $bestScore = -1;
 
         // Try to find the best team for this cluster
-        for ($i = 0; $i < 42; $i++) {
+        for ($i = 0; $i < 48; $i++) {
             // 1. Don't allow same gender+age in same team
             if (hasCategory($teamProfiles[$i], $cluster['gender'], $cluster['age'])) {
                 continue;
@@ -322,7 +365,7 @@ function balanceTeamLeaders(array $teams, array $clusterInfo): array {
 function balanceTeamLanguages(array $teams, array $clusterInfo): array {
     // Helper to normalize language names
     $normalize = function($lang) {
-        $lang = strtolower(trim($lang));
+        $lang = strtolower(trim((string)$lang));
         if ($lang === 'ukrainian' || $lang === 'ukrain') $lang = 'russian';
         if (strpos($lang, 'hinese') !== false) $lang = 'chinese';
         if ($lang === 'english') return null;
@@ -342,6 +385,11 @@ function balanceTeamLanguages(array $teams, array $clusterInfo): array {
     foreach ($clusterInfo as $code => $info) {
         $spoken = array_filter(array_map($normalize, $info['languages'] ?? []));
         $canTranslate = array_filter(array_map($normalize, $info['translationlanguages'] ?? []));
+
+        // Deduplicate and reindex so there are no repeated language entries
+        $spoken = array_values(array_unique($spoken));
+        $canTranslate = array_values(array_unique($canTranslate));
+
         $clusterLangs[$code] = [
             'spoken' => $spoken,
             'canTranslate' => $canTranslate,
@@ -628,20 +676,26 @@ function reportTeamLanguagesAndTranslations(array $teams, array $clusterInfo): v
                 $canTranslate = array_merge($canTranslate, $clusterInfo[$clusterCode]['translationlanguages']);
             }
         }
-        $spoken = array_unique($spoken);
-        $canTranslate = array_unique($canTranslate);
 
         // Normalize: ignore English for translation, treat Ukrainian and Russian as equal
         $normalize = function($lang) {
-            $lang = strtolower(trim($lang));
+            $lang = strtolower(trim((string)$lang));
+            if ($lang === '' || $lang === 'english') return null;
             if ($lang === 'ukrainian' || $lang === 'ukrain') $lang = 'russian';
             if (strpos($lang, 'hinese') !== false) $lang = 'chinese';
-            if ($lang === 'english') return null;
             return $lang;
         };
 
-        $spokenNorm = array_filter(array_map($normalize, $spoken));
-        $canTranslateNorm = array_filter(array_map($normalize, $canTranslate));
+        // Normalize then remove null/empty and dedupe safely
+        $spokenNorm = array_map(fn($l) => $normalize($l), $spoken);
+        $spokenNorm = array_filter($spokenNorm, fn($v) => $v !== null && $v !== '');
+        $spokenNorm = array_map(fn($s) => trim((string)$s), $spokenNorm);
+        $spokenNorm = array_values(array_unique(array_map('strtolower', $spokenNorm)));
+
+        $canTranslateNorm = array_map(fn($l) => $normalize($l), $canTranslate);
+        $canTranslateNorm = array_filter($canTranslateNorm, fn($v) => $v !== null && $v !== '');
+        $canTranslateNorm = array_map(fn($s) => trim((string)$s), $canTranslateNorm);
+        $canTranslateNorm = array_values(array_unique(array_map('strtolower', $canTranslateNorm)));
 
         echo "Team " . ($teamIndex + 1) . ":\n";
         echo "  Languages spoken: " . (empty($spokenNorm) ? "(none)" : implode(", ", $spokenNorm)) . "\n";
@@ -780,7 +834,7 @@ function writeTeamsSummaryCSV(array $teams, array $clusterInfo, array $teamLeade
 
     // Helper to normalize language names
     $normalize = function($lang) {
-        $lang = strtolower(trim($lang));
+        $lang = strtolower(trim((string)$lang));
         if ($lang === 'ukrainian' || $lang === 'ukrain') $lang = 'russian';
         if (strpos($lang, 'hinese') !== false) $lang = 'chinese';
         if ($lang === 'english') return null;
@@ -841,10 +895,23 @@ function writeTeamsSummaryCSV(array $teams, array $clusterInfo, array $teamLeade
         }
 
         // Normalize languages
-        $spokenNorm = array_filter(array_map($normalize, $spoken));
-        $canTranslateNorm = array_filter(array_map($normalize, $canTranslate));
-        $spokenNorm = array_unique($spokenNorm);
-        $canTranslateNorm = array_unique($canTranslateNorm);
+        $spokenNorm = array_map(function($l) use ($normalize) {
+            return $normalize((string)$l);
+        }, $spoken);
+        $canTranslateNorm = array_map(function($l) use ($normalize) {
+            return $normalize((string)$l);
+        }, $canTranslate);
+
+        // Cast to string before trim so trim() never receives null, then remove empty entries
+        $spokenNorm = array_map(function($s) { return trim((string)$s); }, $spokenNorm);
+        $canTranslateNorm = array_map(function($s) { return trim((string)$s); }, $canTranslateNorm);
+
+        $spokenNorm = array_values(array_unique(array_filter($spokenNorm, function($v) { return $v !== ''; })));
+        $canTranslateNorm = array_values(array_unique(array_filter($canTranslateNorm, function($v) { return $v !== ''; })));
+
+        // Final lowercasing + dedupe to collapse equivalents
+        $spokenNorm = array_values(array_unique(array_map('strtolower', $spokenNorm)));
+        $canTranslateNorm = array_values(array_unique(array_map('strtolower', $canTranslateNorm)));
 
         // Languages missing translation
         $missing = array_diff($spokenNorm, $canTranslateNorm);
@@ -955,15 +1022,8 @@ function putClustersTogether(array $teams, string $clusterA, string $clusterB): 
 function putRequestedClusterPairsTogether(array $teams): array {
     // Example pairs to put together
     $pairs = [
-        ['soOT01', 'soRO01'],
-        ['sySP01a', 'sySP04a'],
-        ['soUK04a', 'soUK05a'],
-        ['syFR01a', 'syFR02a'],
-        ['sySP01a', 'sySP04a'],
-        ['bySE01', 'byUK09'],
-        ['boNA06', 'syNA01'],
-        ['byUK02a', 'byUK10a'],
-        ['syUK05', 'sySE01'], // add more pairs as needed
+        //['soOT01', 'soRO01'],
+         // add more pairs as needed
     ];
 
     foreach ($pairs as $pair) {
@@ -1065,10 +1125,10 @@ $teams = putRequestedClusterPairsTogether($teams);
 //print_r($teams);
 $teamSizes = calculateTeamSizes($teams, $clusterInfo);
 $teamLeaders = getAllBestTeamLeaders($teams, $full_file);
-//echo "Team sizes: " . implode(", ", $teamSizes) . "\n";
+echo "Team sizes: " . implode(", ", $teamSizes) . "\n";
 //printTeamPossibleLeaders($teams, $clusterInfo);
 //reportTeamLanguagesAndTranslations($teams, $clusterInfo);
-//printClusterAssignmentsCSV($teams);
+printClusterAssignmentsCSV($teams);
 
 $full_file_with_teams = assignTeamsToFullFile($teams, $full_file);
 
