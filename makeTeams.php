@@ -573,61 +573,210 @@ function enforceCategoryUniqueness(array $teams, array $clusterInfo): array {
     };
 
     $categories = ['by', 'sy', 'bo', 'so'];
-    $maxIterations = 40;
-    for ($iter = 0; $iter < $maxIterations; $iter++) {
+    $teamCount = count($teams);
+
+    // Phase 1: per-category leveling (no team should have > min+1 of a category)
+    $maxPhase1Iter = 40;
+    for ($iter = 0; $iter < $maxPhase1Iter; $iter++) {
         $changed = false;
-        foreach ($categories as $cat) {
-            // Build lists of teams by count of this category
-            $catCounts = [];
-            $catPositions = []; // [teamIdx => [clusterIdx, ...]]
-            foreach ($teams as $teamIdx => $team) {
-                $catClusters = [];
-                foreach ($team as $i => $clusterCode) {
-                    if ($getCategory($clusterCode) === $cat) {
-                        $catClusters[] = $i;
+
+        foreach (['by','sy','bo','so'] as $cat) {
+            // build counts and positions
+            $catCounts = array_fill(0, $teamCount, 0);
+            $catPositions = array_fill(0, $teamCount, []);
+            foreach ($teams as $tIdx => $team) {
+                foreach ($team as $pos => $code) {
+                    if ($getCategory($code) === $cat) {
+                        $catCounts[$tIdx]++;
+                        $catPositions[$tIdx][] = $pos;
                     }
                 }
-                $catPositions[$teamIdx] = $catClusters;
-                $catCounts[$teamIdx] = count($catClusters);
             }
 
-            // While any team has more than min+1 of this category, and another team has less
-            while (true) {
-                $maxCount = max($catCounts);
-                $minCount = min($catCounts);
-                // Don't allow a team to have more than min+1 unless all teams have at least min+1
-                if ($maxCount <= $minCount + 1) break;
+            $maxCount = max($catCounts);
+            $minCount = min($catCounts);
 
-                // Find a team with maxCount and a team with minCount
-                $fromTeam = array_search($maxCount, $catCounts);
-                $toTeam = array_search($minCount, $catCounts);
+            // move until max <= min+1
+            while ($maxCount > $minCount + 1) {
+                $fromTeam = array_search($maxCount, $catCounts, true);
+                $toTeam = array_search($minCount, $catCounts, true);
+                if ($fromTeam === false || $toTeam === false) break;
 
-                // Move one of the extras (not the first, to keep at least min+1)
-                $moveIdx = $catPositions[$fromTeam][$minCount + 1]; // e.g. 2nd if min=1, 3rd if min=2
-                $clusterToMove = $teams[$fromTeam][$moveIdx];
-                // Remove from fromTeam
-                array_splice($teams[$fromTeam], $moveIdx, 1);
-                // Add to toTeam
+                $positions = $catPositions[$fromTeam];
+                if (empty($positions)) break;
+                $movePos = end($positions);
+
+                $clusterToMove = $teams[$fromTeam][$movePos];
+                array_splice($teams[$fromTeam], $movePos, 1);
                 $teams[$toTeam][] = $clusterToMove;
-                $changed = true;
 
-                // Update counts and positions for next round
-                // Rebuild only for affected teams
-                foreach ([$fromTeam, $toTeam] as $teamIdx) {
-                    $catClusters = [];
-                    foreach ($teams[$teamIdx] as $i => $clusterCode) {
-                        if ($getCategory($clusterCode) === $cat) {
-                            $catClusters[] = $i;
+                // rebuild counts & positions for affected teams
+                foreach ([$fromTeam, $toTeam] as $tIdx) {
+                    $catCounts[$tIdx] = 0;
+                    $catPositions[$tIdx] = [];
+                    foreach ($teams[$tIdx] as $pos => $code) {
+                        if ($getCategory($code) === $cat) {
+                            $catCounts[$tIdx]++;
+                            $catPositions[$tIdx][] = $pos;
                         }
                     }
-                    $catPositions[$teamIdx] = $catClusters;
-                    $catCounts[$teamIdx] = count($catClusters);
+                }
+
+                $maxCount = max($catCounts);
+                $minCount = min($catCounts);
+                $changed = true;
+            }
+        }
+
+        if (!$changed) break;
+    }
+
+    // Phase 2: distribute younger clusters (by/sy) more evenly across teams
+    $maxPhase2Iter = 200;
+    for ($iter = 0; $iter < $maxPhase2Iter; $iter++) {
+        $yCounts = array_fill(0, $teamCount, 0);
+        $yPositions = array_fill(0, $teamCount, []);
+        $totalY = 0;
+        for ($t = 0; $t < $teamCount; $t++) {
+            foreach ($teams[$t] as $pos => $code) {
+                $cat = $getCategory($code);
+                if ($cat === 'by' || $cat === 'sy') {
+                    $yCounts[$t]++;
+                    $yPositions[$t][] = $pos;
+                    $totalY++;
                 }
             }
         }
+
+        if ($totalY === 0) break;
+        $target = (int) ceil($totalY / $teamCount);
+
+        $maxY = max($yCounts);
+        $minY = min($yCounts);
+        if ($maxY <= $target && $minY >= max(0, $target-1)) break;
+
+        $fromTeam = null;
+        $toTeam = null;
+        for ($t = 0; $t < $teamCount; $t++) {
+            if ($yCounts[$t] > $target) { $fromTeam = $t; break; }
+        }
+        for ($t = 0; $t < $teamCount; $t++) {
+            if ($yCounts[$t] < $target) { $toTeam = $t; break; }
+        }
+
+        if ($fromTeam === null || $toTeam === null) break;
+
+        $movePos = null;
+        $candidatePos = $yPositions[$fromTeam];
+        $toCats = [];
+        foreach ($teams[$toTeam] as $code) {
+            $c = $getCategory($code);
+            if ($c) $toCats[$c] = true;
+        }
+        foreach ($candidatePos as $pos) {
+            $code = $teams[$fromTeam][$pos];
+            $c = $getCategory($code); // by or sy
+            if (!isset($toCats[$c])) { $movePos = $pos; break; }
+        }
+        if ($movePos === null) {
+            $movePos = end($candidatePos);
+            if ($movePos === false) break;
+        }
+
+        $clusterToMove = $teams[$fromTeam][$movePos];
+        array_splice($teams[$fromTeam], $movePos, 1);
+        $teams[$toTeam][] = $clusterToMove;
+    }
+
+    // Phase 3: fix teams that are old-only / old-heavy by swapping in extra younger clusters from donors
+    $maxPhase3Iter = 200;
+    for ($iter = 0; $iter < $maxPhase3Iter; $iter++) {
+        $changed = false;
+
+        // compute per-team y counts and positions, and old positions
+        $yCounts = array_fill(0, $teamCount, 0);
+        $yPositions = array_fill(0, $teamCount, []);
+        $oldCounts = array_fill(0, $teamCount, 0);
+        $oldPositions = array_fill(0, $teamCount, []);
+        for ($t = 0; $t < $teamCount; $t++) {
+            foreach ($teams[$t] as $pos => $code) {
+                $cat = $getCategory($code);
+                if ($cat === 'by' || $cat === 'sy') {
+                    $yCounts[$t]++; $yPositions[$t][] = $pos;
+                } elseif ($cat === 'bo' || $cat === 'so') {
+                    $oldCounts[$t]++; $oldPositions[$t][] = $pos;
+                }
+            }
+        }
+
+        // identify target teams: zero yCounts and at least 2 old clusters (so/bo)
+        $targets = [];
+        foreach ($teams as $t => $_) {
+            if ($yCounts[$t] === 0 && $oldCounts[$t] >= 2) $targets[] = $t;
+        }
+
+        if (empty($targets)) break;
+
+        // identify donor teams: yCounts > 1 (have an extra young cluster)
+        $donors = [];
+        foreach ($teams as $t => $_) {
+            if ($yCounts[$t] > 1) $donors[] = $t;
+        }
+
+        if (empty($donors)) break;
+
+        // Try to move one y cluster from a donor into each target, swapping with an old duplicate
+        foreach ($targets as $target) {
+            if ($yCounts[$target] > 0) continue; // may have changed
+            // prefer swapping an old cluster that is duplicated category (if any)
+            // find an old category that occurs >1 and pick its second occurrence
+            $targetOldCats = [];
+            foreach ($teams[$target] as $pos => $code) {
+                $cat = $getCategory($code);
+                if ($cat === 'bo' || $cat === 'so') {
+                    $targetOldCats[$cat][] = $pos;
+                }
+            }
+
+            $swapPos = null;
+            foreach (['so','bo'] as $oldCat) {
+                if (!empty($targetOldCats[$oldCat]) && count($targetOldCats[$oldCat]) > 1) {
+                    $swapPos = $targetOldCats[$oldCat][1]; // second occurrence
+                    break;
+                }
+            }
+            // if no duplicate-specific found, just pick last old position
+            if ($swapPos === null && !empty($oldPositions[$target])) {
+                $swapPos = end($oldPositions[$target]);
+            }
+            if ($swapPos === null) continue;
+
+            // find a donor and a y-cluster to swap in
+            $performed = false;
+            foreach ($donors as $dIdx) {
+                if ($yCounts[$dIdx] <= 1) continue;
+                // find candidate y positions in donor
+                foreach ($yPositions[$dIdx] as $dPos) {
+                    // pick this donor cluster
+                    $donorCluster = $teams[$dIdx][$dPos];
+                    // perform swap
+                    $tmp = $teams[$target][$swapPos];
+                    $teams[$target][$swapPos] = $teams[$dIdx][$dPos];
+                    $teams[$dIdx][$dPos] = $tmp;
+
+                    $changed = true;
+                    $performed = true;
+                    break 2;
+                }
+            }
+            // after one swap, recompute next iteration
+            if ($performed) break;
+        }
+
         if (!$changed) break;
     }
-    return fixMultipleDuplicateCategories($teams);
+
+    return $teams;
 }
 
 // These are reporting functions to calculate team sizes and print possible leaders
@@ -1116,18 +1265,18 @@ $clusterInfo = collectClusterInfo($full_file);
 $teams = distributeClustersToTeams($clusterInfo);
 $teams = enforceCategoryUniqueness($teams, $clusterInfo);
 $teams = balanceTeamSizes($teams, $clusterInfo);
-$teams = balanceTeamLanguages($teams, $clusterInfo);
-$teams = putRequestedClusterPairsTogether($teams);
-$teams = balanceTeamLeaders($teams, $clusterInfo);
-$teams = enforceCategoryUniqueness($teams, $clusterInfo);
-$teams = putRequestedClusterPairsTogether($teams);
+//$teams = balanceTeamLanguages($teams, $clusterInfo);
+//$teams = putRequestedClusterPairsTogether($teams);
+//$teams = balanceTeamLeaders($teams, $clusterInfo);
+//$teams = enforceCategoryUniqueness($teams, $clusterInfo);
+//$teams = putRequestedClusterPairsTogether($teams);
 
 //print_r($teams);
 $teamSizes = calculateTeamSizes($teams, $clusterInfo);
 $teamLeaders = getAllBestTeamLeaders($teams, $full_file);
 echo "Team sizes: " . implode(", ", $teamSizes) . "\n";
 //printTeamPossibleLeaders($teams, $clusterInfo);
-//reportTeamLanguagesAndTranslations($teams, $clusterInfo);
+reportTeamLanguagesAndTranslations($teams, $clusterInfo);
 printClusterAssignmentsCSV($teams);
 
 $full_file_with_teams = assignTeamsToFullFile($teams, $full_file);
